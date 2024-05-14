@@ -91,3 +91,73 @@ func TestReadCommitted(t *testing.T) {
 	res = c4.execCommand("get", []string{"x"})
 	assertEq(res, "", "c4 get x")
 }
+
+func TestRepeatableRead(t *testing.T) {
+	database := newDatabase(10)
+	database.defaultIsolation = RepeatableReadIsolation
+
+	c1 := database.newConnection()
+	c1.execCommand("begin", nil)
+
+	c2 := database.newConnection()
+	c2.execCommand("begin", nil)
+
+	// Local change is visible locally.
+	c1.execCommand("set", []string{"x", "hey"})
+	res := c1.execCommand("get", []string{"x"})
+	assertEq(res, "hey", "c1 get x")
+
+	// Update not available to this transaction since this is not
+	// committed.
+	res = c2.execCommand("get", []string{"x"})
+	assertEq(res, "", "c2 get x")
+
+	c1.execCommand("commit", nil)
+
+	// Even after committing, it's not visible in an existing
+	// transaction.
+	res = c2.execCommand("get", []string{"x"})
+	assertEq(res, "", "c2 get x")
+
+	// But is available in a new transaction.
+	c3 := database.newConnection()
+	c3.execCommand("begin", nil)
+
+	res = c3.execCommand("get", []string{"x"})
+	assertEq(res, "hey", "c3 get x")
+
+	// Local change is visible locally.
+	c3.execCommand("set", []string{"x", "yall"})
+	res = c3.execCommand("get", []string{"x"})
+	assertEq(res, "yall", "c3 get x")
+
+	// But not on the other commit, again.
+	res = c2.execCommand("get", []string{"x"})
+	assertEq(res, "", "c2 get x")
+
+	c3.execCommand("abort", nil)
+
+	// And still not, regardless of abort, because it's an older
+	// transaction.
+	res = c2.execCommand("get", []string{"x"})
+	assertEq(res, "", "c2 get x")
+
+	// And again still the aborted set is still not on a new
+	// transaction.
+	c4 := database.newConnection()
+	res = c4.execCommand("begin", nil)
+
+	res = c4.execCommand("get", []string{"x"})
+	assertEq(res, "hey", "c4 get x")
+
+	c4.execCommand("delete", []string{"x"})
+	c4.execCommand("commit", nil)
+
+	// But the delete is visible to new transactions now that this
+	// has been committed.
+	c5 := database.newConnection()
+	res = c5.execCommand("begin", nil)
+
+	res = c5.execCommand("get", []string{"x"})
+	assertEq(res, "", "c5 get x")
+}

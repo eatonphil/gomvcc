@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"slices"
 	"sync"
 )
@@ -10,6 +11,17 @@ func assert(b bool, msg string) {
 	if !b {
 		panic(msg)
 	}
+}
+
+var DEBUG = slices.Contains(os.Args, "--debug")
+
+func debug(a ...any) {
+	if !DEBUG {
+		return
+	}
+
+	args := append([]any{"[DEBUG]"}, a...)
+	fmt.Println(args...)
 }
 
 type Value struct {
@@ -72,6 +84,8 @@ func newDatabase(n int) Database {
 }
 
 func (d *Database) completeTransaction(t *Transaction, state TransactionState) {
+	debug("completing transaction ", t.id)
+
 	// Update history.
 	d.mu.Lock()
 	d.history[t.id] = state
@@ -82,6 +96,7 @@ func (d *Database) completeTransaction(t *Transaction, state TransactionState) {
 		if txId == t.id {
 			d.inprogress[i] = d.inprogress[len(d.inprogress)-1]
 			d.inprogress = d.inprogress[:len(d.inprogress)-1]
+			assert(!slices.Contains(d.inprogress, t.id), "inprogress cleaned up")
 		}
 	})
 
@@ -107,10 +122,15 @@ func (d *Database) nextFreeTransaction() *Transaction {
 	d.mu.Lock()
 	t.isolation = d.defaultIsolation
 	t.id = d.nextTransactionId
+	for _, id := range d.inprogress {
+		t.inprogress = append(t.inprogress, id)
+	}
 	d.history[t.id] = InProgressTransaction
 	d.nextTransactionId++
 	d.inprogress = append(d.inprogress, t.id)
 	d.mu.Unlock()
+
+	debug("starting transaction", t.id)
 
 	return t
 }
@@ -206,17 +226,12 @@ type Connection struct {
 }
 
 func (c *Connection) execCommand(command string, args []string) string {
-	fmt.Println(command, args)
+	debug(command, args)
 
 	if command == "begin" {
 		c.tx = c.database.nextFreeTransaction()
 		c.database.assertValidTransaction(c.tx)
 		assert(c.tx.id > 0, "valid transaction")
-		c.database.doForInprogress(func(txId uint64, _ int) {
-			if txId != c.tx.id {
-				c.tx.inprogress = append(c.tx.inprogress, txId)
-			}
-		})
 		return fmt.Sprintf("%d", c.tx.id)
 	}
 
@@ -240,11 +255,17 @@ func (c *Connection) execCommand(command string, args []string) string {
 		key := args[0]
 
 		// Mark any visible versions as now invalid.
+		found := false
 		for i := len(c.database.store[key]) - 1; i >= 0; i-- {
 			value := &c.database.store[key][i]
+			debug(value, c.tx, c.database.isvisible(c.tx, *value))
 			if c.database.isvisible(c.tx, *value) {
 				value.txEndId = c.tx.id
+				found = true
 			}
+		}
+		if command == "delete" && !found {
+			assert(false, "cannot delete unset value")
 		}
 
 		// And add a new version if it's a set command.
@@ -268,7 +289,7 @@ func (c *Connection) execCommand(command string, args []string) string {
 		key := args[0]
 		for i := len(c.database.store[key]) - 1; i >= 0; i-- {
 			value := c.database.store[key][i]
-			fmt.Println(value, c.tx)
+			debug(value, c.tx, c.database.isvisible(c.tx, value))
 			if c.database.isvisible(c.tx, value) {
 				return value.value
 			}

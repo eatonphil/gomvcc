@@ -6,3 +6,9 @@ levels.
 ```console
 $ go test
 ```
+
+With debug logs:
+
+```console
+$ go test -- --debug
+```
