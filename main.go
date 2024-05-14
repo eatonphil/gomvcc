@@ -14,11 +14,12 @@ func assert(b bool, msg string) {
 
 type Value struct {
 	txStartId uint64
-	txEndId uint64
-	value string
+	txEndId   uint64
+	value     string
 }
 
 type TransactionState uint8
+
 const (
 	InProgressTransaction TransactionState = iota
 	AbortedTransaction
@@ -26,6 +27,7 @@ const (
 )
 
 type Isolation uint8
+
 const (
 	ReadUncommittedIsolation Isolation = iota
 	ReadCommittedIsolation
@@ -34,21 +36,21 @@ const (
 )
 
 type Transaction struct {
-	isolation Isolation
-	id uint64
+	isolation  Isolation
+	id         uint64
 	inprogress []uint64
 }
 
 type Database struct {
-	mu sync.Mutex
-	txs chan *Transaction
+	mu               sync.Mutex
+	txs              chan *Transaction
 	defaultIsolation Isolation
 
 	// Must be accessed via mutex.
-	store map[string][]Value
-	history map[uint64]TransactionState
+	store             map[string][]Value
+	history           map[uint64]TransactionState
 	nextTransactionId uint64
-	inprogress []uint64
+	inprogress        []uint64
 }
 
 func newDatabase(n int) Database {
@@ -58,14 +60,14 @@ func newDatabase(n int) Database {
 	}
 
 	return Database{
-		mu: sync.Mutex{},
-		txs: txs,
+		mu:               sync.Mutex{},
+		txs:              txs,
 		defaultIsolation: ReadCommittedIsolation,
 
-		store: map[string][]Value{},
-		history: map[uint64]TransactionState{},
+		store:             map[string][]Value{},
+		history:           map[uint64]TransactionState{},
 		nextTransactionId: 1,
-		inprogress: []uint64{},
+		inprogress:        []uint64{},
 	}
 }
 
@@ -76,10 +78,10 @@ func (d *Database) completeTransaction(t *Transaction, state TransactionState) {
 	d.mu.Unlock()
 
 	// Remove transaction from inprogress list.
-	d.doForInprogress(func (txId uint64, i int) {
+	d.doForInprogress(func(txId uint64, i int) {
 		if txId == t.id {
-			d.inprogress[i] = d.inprogress[len(d.inprogress) - 1]
-			d.inprogress = d.inprogress[:len(d.inprogress) - 1]
+			d.inprogress[i] = d.inprogress[len(d.inprogress)-1]
+			d.inprogress = d.inprogress[:len(d.inprogress)-1]
 		}
 	})
 
@@ -113,7 +115,7 @@ func (d *Database) nextFreeTransaction() *Transaction {
 	return t
 }
 
-func (d *Database) doForInprogress(do func (uint64, int)) {
+func (d *Database) doForInprogress(do func(uint64, int)) {
 	d.mu.Lock()
 	for i, txId := range d.inprogress {
 		do(txId, i)
@@ -199,7 +201,7 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 }
 
 type Connection struct {
-	tx *Transaction
+	tx       *Transaction
 	database *Database
 }
 
@@ -210,7 +212,7 @@ func (c *Connection) execCommand(command string, args []string) string {
 		c.tx = c.database.nextFreeTransaction()
 		c.database.assertValidTransaction(c.tx)
 		assert(c.tx.id > 0, "valid transaction")
-		c.database.doForInprogress(func (txId uint64, _ int) {
+		c.database.doForInprogress(func(txId uint64, _ int) {
 			if txId != c.tx.id {
 				c.tx.inprogress = append(c.tx.inprogress, txId)
 			}
@@ -250,8 +252,8 @@ func (c *Connection) execCommand(command string, args []string) string {
 			value := args[1]
 			c.database.store[key] = append(c.database.store[key], Value{
 				txStartId: c.tx.id,
-				txEndId: 0,
-				value: value,
+				txEndId:   0,
+				value:     value,
 			})
 
 			return value
@@ -264,7 +266,7 @@ func (c *Connection) execCommand(command string, args []string) string {
 		c.database.assertValidTransaction(c.tx)
 
 		key := args[0]
-		for i := len(c.database.store[key]) -1; i >= 0; i-- {
+		for i := len(c.database.store[key]) - 1; i >= 0; i-- {
 			value := c.database.store[key][i]
 			fmt.Println(value, c.tx)
 			if c.database.isvisible(c.tx, value) {
@@ -282,6 +284,6 @@ func (c *Connection) execCommand(command string, args []string) string {
 func (d *Database) newConnection() *Connection {
 	return &Connection{
 		database: d,
-		tx: nil,
+		tx:       nil,
 	}
 }

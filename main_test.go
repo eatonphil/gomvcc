@@ -17,7 +17,7 @@ func TestReadUncommitted(t *testing.T) {
 
 	c1 := database.newConnection()
 	c1.execCommand("begin", nil)
-	
+
 	c2 := database.newConnection()
 	c2.execCommand("begin", nil)
 
@@ -38,7 +38,7 @@ func TestReadCommitted(t *testing.T) {
 
 	c1 := database.newConnection()
 	c1.execCommand("begin", nil)
-	
+
 	c2 := database.newConnection()
 	c2.execCommand("begin", nil)
 
