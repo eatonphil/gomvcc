@@ -42,7 +42,9 @@ type Transaction struct {
 type Database struct {
 	mu sync.Mutex
 	txs chan *Transaction
+	defaultIsolation Isolation
 
+	// Must be accessed via mutex.
 	store map[string][]Value
 	history map[uint64]TransactionState
 	nextTransactionId uint64
@@ -56,8 +58,10 @@ func newDatabase(n int) Database {
 	}
 
 	return Database{
-		txs: txs,
 		mu: sync.Mutex{},
+		txs: txs,
+		defaultIsolation: ReadCommittedIsolation,
+
 		store: map[string][]Value{},
 		history: map[uint64]TransactionState{},
 		nextTransactionId: 1,
@@ -78,7 +82,7 @@ func (d *Database) completeTransaction(t *Transaction, state TransactionState) {
 			d.inprogress = d.inprogress[:len(d.inprogress) - 1]
 		}
 	})
-	
+
 	// Reset transaction state.
 	t.id = 0
 	t.inprogress = nil
@@ -99,6 +103,7 @@ func (d *Database) nextFreeTransaction() *Transaction {
 
 	// Assign and increment transaction id.
 	d.mu.Lock()
+	t.isolation = d.defaultIsolation
 	t.id = d.nextTransactionId
 	d.history[t.id] = InProgressTransaction
 	d.nextTransactionId++
@@ -122,43 +127,75 @@ func (d *Database) assertValidTransaction(t *Transaction) {
 }
 
 func (d *Database) isvisible(t *Transaction, value Value) bool {
+	// READ UNCOMMITTED means we simply read the last value
+	// written. Even if the transaction that wrote this value has
+	// not committed, and even if it has aborted.
 	if t.isolation == ReadUncommittedIsolation {
-		// READ UNCOMMITTED means we simply read the last
-		// value written. Even if the transaction that wrote
-		// this value has not committed, and even if it has
-		// aborted.
 		return true
 	}
 
+	// READ COMMITTED means we are allowed to read any values that
+	// are committed at the point in time where we read.
 	if t.isolation == ReadCommittedIsolation {
-		// READ COMMITTED means we are allowed to read any
-		// values that are committed at the point in time
-		// where we read.
-		return d.transactionState(value.txStartId) == CommittedTransaction &&
-			(value.txEndId == 0 || d.transactionState(value.txEndId) == CommittedTransaction)
+		// If the value was created by a transaction that is
+		// not committed, and not this current transaction,
+		// it's no good.
+		if d.transactionState(value.txStartId) != CommittedTransaction &&
+			value.txStartId != t.id {
+			return false
+		}
+
+		// If the value was deleted in this transaction, it's no good.
+		if value.txEndId == t.id {
+			return false
+		}
+
+		// Or if the value was deleted in some other committed
+		// transaction, it's no good.
+		if d.transactionState(value.txEndId) == CommittedTransaction {
+			return false
+		}
+
+		// Otherwise the value is good.
+		return true
 	}
 
+	// REPEATABLE READ further restricts READ COMMITTED so only
+	// versions from transactions that completed before this one
+	// started are visible.
 	assert(t.isolation == RepeatableReadIsolation, "is repeatable read")
-	return ((
-		// The version must have been committed, and committed by a transaction
-		// that was not in progress when this transaction started.
-		(value.txStartId <= t.id &&
-			d.transactionState(value.txStartId) == CommittedTransaction &&
-			!slices.Contains(t.inprogress, value.txStartId)) &&
+	// Ignore values from transactions started after this one.
+	if value.txStartId > t.id {
+		return false
+	}
 
-			// And it must still be valid. Or deleted by a
-			// transaction that committed, and by a
-			// transaction that was not in progress when
-			// this transaction started.
-			(
-				value.txEndId == 0 ||
-					(
-						value.txEndId < t.id &&
-							d.transactionState(value.txEndId) == CommittedTransaction &&
-							!slices.Contains(t.inprogress, value.txEndId)))) ||
+	// Ignore values created from transactions in progress when
+	// this one started.
+	if slices.Contains(t.inprogress, value.txStartId) {
+		return false
+	}
 
-		// Or the version could be from the current transaction and valid.
-		(value.txStartId == t.id && value.txEndId == 0))
+	// If the value was created by a transaction that is not
+	// committed, and not this current transaction, it's no good.
+	if d.transactionState(value.txStartId) != CommittedTransaction &&
+		value.txStartId != t.id {
+		return false
+	}
+
+	// If the value was deleted in this transaction, it's no good.
+	if value.txEndId == t.id {
+		return false
+	}
+
+	// Or if the value was deleted in some other committed
+	// transaction that started before this one, it's no good.
+	if value.txEndId < t.id &&
+		d.transactionState(value.txEndId) == CommittedTransaction &&
+		!slices.Contains(t.inprogress, value.txEndId) {
+		return false
+	}
+
+	return true
 }
 
 type Connection struct {
@@ -167,6 +204,8 @@ type Connection struct {
 }
 
 func (c *Connection) execCommand(command string, args []string) string {
+	fmt.Println(command, args)
+
 	if command == "begin" {
 		c.tx = c.database.nextFreeTransaction()
 		c.database.assertValidTransaction(c.tx)
@@ -227,6 +266,7 @@ func (c *Connection) execCommand(command string, args []string) string {
 		key := args[0]
 		for i := len(c.database.store[key]) -1; i >= 0; i-- {
 			value := c.database.store[key][i]
+			fmt.Println(value, c.tx)
 			if c.database.isvisible(c.tx, value) {
 				return value.value
 			}
