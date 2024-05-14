@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"slices"
 	"sync"
-	"net/http"
-	"log"
 )
 
 func assert(b bool, msg string) {
@@ -67,21 +65,12 @@ func newDatabase(n int) Database {
 	}
 }
 
-func (d *Database) markAndReleaseTransaction(t *Transaction, state TransactionState) {
+func (d *Database) completeTransaction(t *Transaction, state TransactionState) {
+	// Update history.
 	d.mu.Lock()
 	d.history[t.id] = state
 	d.mu.Unlock()
-	d.releaseTransaction(t)
-}
 
-func (d *Database) transactionState(txId uint64) TransactionState {
-	d.mu.Lock()
-	s := d.history[txId]
-	d.mu.Unlock()
-	return s
-}
-
-func (d *Database) releaseTransaction(t *Transaction) {
 	// Remove transaction from inprogress list.
 	d.doForInprogress(func (txId uint64, i int) {
 		if txId == t.id {
@@ -90,11 +79,19 @@ func (d *Database) releaseTransaction(t *Transaction) {
 		}
 	})
 	
-	// Reset state.
+	// Reset transaction state.
 	t.id = 0
 	t.inprogress = nil
 
+	// Add back to the pool.
 	d.txs <- t
+}
+
+func (d *Database) transactionState(txId uint64) TransactionState {
+	d.mu.Lock()
+	s := d.history[txId]
+	d.mu.Unlock()
+	return s
 }
 
 func (d *Database) nextFreeTransaction() *Transaction {
@@ -169,7 +166,7 @@ type Connection struct {
 	database *Database
 }
 
-func (c Connection) execCommand(command string, args []string) string {
+func (c *Connection) execCommand(command string, args []string) string {
 	if command == "begin" {
 		c.tx = c.database.nextFreeTransaction()
 		c.database.assertValidTransaction(c.tx)
@@ -179,18 +176,20 @@ func (c Connection) execCommand(command string, args []string) string {
 				c.tx.inprogress = append(c.tx.inprogress, txId)
 			}
 		})
-		return fmt.Sprintf("%ld", c.tx.id)
+		return fmt.Sprintf("%d", c.tx.id)
 	}
 
 	if command == "abort" {
 		c.database.assertValidTransaction(c.tx)
-		c.database.markAndReleaseTransaction(c.tx, AbortedTransaction)
+		c.database.completeTransaction(c.tx, AbortedTransaction)
+		c.tx = nil
 		return ""
 	}
 
 	if command == "commit" {
 		c.database.assertValidTransaction(c.tx)
-		c.database.markAndReleaseTransaction(c.tx, CommittedTransaction)
+		c.database.completeTransaction(c.tx, CommittedTransaction)
+		c.tx = nil
 		return ""
 	}
 
@@ -232,23 +231,17 @@ func (c Connection) execCommand(command string, args []string) string {
 				return value.value
 			}
 		}
+
+		return ""
 	}
 
 	assert(false, "no such command")
 	return ""
 }
 
-func main() {
-	database := newDatabase(10)
-
-	http.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
-		c := Connection{
-			tx: nil,
-			database: &database,
-		}
-		res := c.execCommand("get", []string{"x"})
-		fmt.Fprintf(w, "%s", res)
-	})
-
-	log.Fatal(http.ListenAndServe(":8080", nil))
+func (d *Database) newConnection() *Connection {
+	return &Connection{
+		database: d,
+		tx: nil,
+	}
 }
