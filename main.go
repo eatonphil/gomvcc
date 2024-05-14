@@ -2,63 +2,130 @@ package main
 
 import (
 	"fmt"
-	"time"
+	"slices"
+	"sync"
+	"net/http"
+	"log"
 )
+
+func assert(b bool, msg string) {
+	if !b {
+		panic(msg)
+	}
+}
 
 type Value struct {
 	txStartId uint64
 	txEndId uint64
-	value int
+	value string
 }
-var table = map[string][]Value{}
 
-type Transaction struct {
-	id uint64
-	aborted bool
-	committed bool
-	inprogress []uint64
-}
+type TransactionState uint8
+const (
+	InProgressTransaction TransactionState = iota
+	AbortedTransaction
+	CommittedTransaction
+)
 
 type Isolation uint8
 const (
-	ReadUncommittedIsolation
+	ReadUncommittedIsolation Isolation = iota
 	ReadCommittedIsolation
 	RepeatableReadIsolation
 	SerializableIsolation
 )
 
-var isolation Isolation
-type Transactions struct {
-	inuse []bool
-	txs []Transaction	
+type Transaction struct {
+	isolation Isolation
+	id uint64
+	inprogress []uint64
 }
 
-func newTransactions(n uint) Transactions {
-	return Transactions{
-		sem: semaphore.NewWeighted(n),
-		inuse: make([]bool, n),
-		txs: make([]Transaction, n),
+type Database struct {
+	mu sync.Mutex
+	txs chan *Transaction
+
+	store map[string][]Value
+	history map[uint64]TransactionState
+	nextTransactionId uint64
+	inprogress []uint64
+}
+
+func newDatabase(n int) Database {
+	txs := make(chan *Transaction, n)
+	for i := 0; i < n; i++ {
+		txs <- &Transaction{}
+	}
+
+	return Database{
+		txs: txs,
+		mu: sync.Mutex{},
+		store: map[string][]Value{},
+		history: map[uint64]TransactionState{},
+		nextTransactionId: 1,
+		inprogress: []uint64{},
 	}
 }
 
-func (ts *Transactions) next() *Transaction {
-	for {
-		for i := range inuse {
-			if !inuse[i] {
-				return &txs[i]
-			}
+func (d *Database) markAndReleaseTransaction(t *Transaction, state TransactionState) {
+	d.mu.Lock()
+	d.history[t.id] = state
+	d.mu.Unlock()
+	d.releaseTransaction(t)
+}
+
+func (d *Database) transactionState(txId uint64) TransactionState {
+	d.mu.Lock()
+	s := d.history[txId]
+	d.mu.Unlock()
+	return s
+}
+
+func (d *Database) releaseTransaction(t *Transaction) {
+	// Remove transaction from inprogress list.
+	d.doForInprogress(func (txId uint64, i int) {
+		if txId == t.id {
+			d.inprogress[i] = d.inprogress[len(d.inprogress) - 1]
+			d.inprogress = d.inprogress[:len(d.inprogress) - 1]
 		}
-	}
+	})
+	
+	// Reset state.
+	t.id = 0
+	t.inprogress = nil
+
+	d.txs <- t
 }
 
-func assert(b bool, msg string) {
-	if !b {
-		panic(string)
-	}
+func (d *Database) nextFreeTransaction() *Transaction {
+	t := <-d.txs
+
+	// Assign and increment transaction id.
+	d.mu.Lock()
+	t.id = d.nextTransactionId
+	d.history[t.id] = InProgressTransaction
+	d.nextTransactionId++
+	d.inprogress = append(d.inprogress, t.id)
+	d.mu.Unlock()
+
+	return t
 }
 
-func isvisible(value Value, txId uint64) bool {
-	if isolation == ReadUncommittedIsolation {
+func (d *Database) doForInprogress(do func (uint64, int)) {
+	d.mu.Lock()
+	for i, txId := range d.inprogress {
+		do(txId, i)
+	}
+	d.mu.Unlock()
+}
+
+func (d *Database) assertValidTransaction(t *Transaction) {
+	assert(t.id > 0, "valid id")
+	assert(d.transactionState(t.id) == InProgressTransaction, "in progress")
+}
+
+func (d *Database) isvisible(t *Transaction, value Value) bool {
+	if t.isolation == ReadUncommittedIsolation {
 		// READ UNCOMMITTED means we simply read the last
 		// value written. Even if the transaction that wrote
 		// this value has not committed, and even if it has
@@ -66,110 +133,122 @@ func isvisible(value Value, txId uint64) bool {
 		return true
 	}
 
-	if isolation == ReadCommittedIsolation {
+	if t.isolation == ReadCommittedIsolation {
 		// READ COMMITTED means we are allowed to read any
 		// values that are committed at the point in time
 		// where we read.
-		return transactions[instance.txStartId].committed && (instance.endTxId == 0 || transactions[instance.endTxId].committed)
+		return d.transactionState(value.txStartId) == CommittedTransaction &&
+			(value.txEndId == 0 || d.transactionState(value.txEndId) == CommittedTransaction)
 	}
 
-	assert(isolation == RepeatableReadIsolation)
-	visible :=
-		(
-			// The version must have been created by a
-			// transaction before this one that was
-			// committed.
-			(instance.txStartId <= txId &&
-				transactions[instance.txStartId].committed &&
-				!slices.Contains(tx.inprogress, instance.txStartId))
-			&&
-				// And it must still be valid.
-				(
-					instance.txEndId == 0 ||
-						(
-							instance.txEndId < txId &&
-								transactions[instance.txEndId].committed &&
-								!slices.Contains(tx.inprogress, instance.txEndId))
-				)
-		)
-	// Or the version could be from the current transaction.
-	|| (instance.txStartId == txId && instance.txEndId == 0)
+	assert(t.isolation == RepeatableReadIsolation, "is repeatable read")
+	return ((
+		// The version must have been committed, and committed by a transaction
+		// that was not in progress when this transaction started.
+		(value.txStartId <= t.id &&
+			d.transactionState(value.txStartId) == CommittedTransaction &&
+			!slices.Contains(t.inprogress, value.txStartId)) &&
 
-	return visible
+			// And it must still be valid. Or deleted by a
+			// transaction that committed, and by a
+			// transaction that was not in progress when
+			// this transaction started.
+			(
+				value.txEndId == 0 ||
+					(
+						value.txEndId < t.id &&
+							d.transactionState(value.txEndId) == CommittedTransaction &&
+							!slices.Contains(t.inprogress, value.txEndId)))) ||
+
+		// Or the version could be from the current transaction and valid.
+		(value.txStartId == t.id && value.txEndId == 0))
 }
 
-func execCommand(txId uint64, command string, args []string) string {
+type Connection struct {
+	tx *Transaction
+	database *Database
+}
+
+func (c Connection) execCommand(command string, args []string) string {
 	if command == "begin" {
-		id := uint64(len(transactions))
-		assert(id > 0, "valid transaction")
-		var inprogress []uint64
-		for _, t := range transactions {
-			if !t.committed && !t.aborted {
-				inprogress = append(inprogress, t.id)
+		c.tx = c.database.nextFreeTransaction()
+		c.database.assertValidTransaction(c.tx)
+		assert(c.tx.id > 0, "valid transaction")
+		c.database.doForInprogress(func (txId uint64, _ int) {
+			if txId != c.tx.id {
+				c.tx.inprogress = append(c.tx.inprogress, txId)
 			}
-		}
-		transactions = append(transactions, Transaction{
-			id: id,
-			aborted: false,
-			committed: false,
-			inprogress: inprogress,
 		})
-		return fmt.Sprintf("%ld", id)
+		return fmt.Sprintf("%ld", c.tx.id)
 	}
 
 	if command == "abort" {
-		assert(txId > 0, "valid transaction")
-		assert(txId < len(transactions), "real transaction")
-		transactions[txId].aborted = true
-		transactions[txId].inprogress = nil
+		c.database.assertValidTransaction(c.tx)
+		c.database.markAndReleaseTransaction(c.tx, AbortedTransaction)
 		return ""
 	}
 
 	if command == "commit" {
-		transactions[txId].committed = true
-		transactions[txId].inprogress = nil
+		c.database.assertValidTransaction(c.tx)
+		c.database.markAndReleaseTransaction(c.tx, CommittedTransaction)
 		return ""
 	}
 
-	assert(txId > 0, "valid transaction")
-	assert(txId < len(transactions), "real transaction")
-	assert(!transactions[txId].committed, "not committed")
-	assert(!transactions[txId].aborted, "not aborted")
-
 	if command == "set" || command == "delete" {
+		c.database.assertValidTransaction(c.tx)
+
 		key := args[0]
 
 		// Mark any visible versions as now invalid.
-		for i := len(store[key]) - 1; i >= 0; i-- {
-			if isvisible(store[key], txId) {
-				value[i].txEndId = txId
+		for i := len(c.database.store[key]) - 1; i >= 0; i-- {
+			value := &c.database.store[key][i]
+			if c.database.isvisible(c.tx, *value) {
+				value.txEndId = c.tx.id
 			}
 		}
 
 		// And add a new version if it's a set command.
 		if command == "set" {
 			value := args[1]
-			store[key] = append(store[key], Value{
-				txStartId: txId,
+			c.database.store[key] = append(c.database.store[key], Value{
+				txStartId: c.tx.id,
 				txEndId: 0,
 				value: value,
 			})
+
+			return value
 		}
-		return value
+
+		return ""
 	}
 
 	if command == "get" {
+		c.database.assertValidTransaction(c.tx)
+
 		key := args[0]
-		for i := len(store[key]) -1; i >= 0; i-- {
-			instance := store[key]
-			if isvisible(instance, txId) {
-				return instance.value
+		for i := len(c.database.store[key]) -1; i >= 0; i-- {
+			value := c.database.store[key][i]
+			if c.database.isvisible(c.tx, value) {
+				return value.value
 			}
 		}
 	}
+
+	assert(false, "no such command")
+	return ""
 }
 
 func main() {
-	// Empty transaction so that transactionIds always start at 1.
-	transactions = append(transactions, Transaction{})
+	database := newDatabase(10)
+
+	http.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
+		c := Connection{
+			tx: nil,
+			database: &database,
+		}
+		res := c.execCommand("get", []string{"x"})
+		fmt.Fprintf(w, "%s", res)
+	})
+
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
