@@ -221,45 +221,45 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 }
 
 type Connection struct {
-	tx       *Transaction
-	database *Database
+	tx *Transaction
+	db *Database
 }
 
 func (c *Connection) execCommand(command string, args []string) string {
 	debug(command, args)
 
 	if command == "begin" {
-		c.tx = c.database.nextFreeTransaction()
-		c.database.assertValidTransaction(c.tx)
+		c.tx = c.db.nextFreeTransaction()
+		c.db.assertValidTransaction(c.tx)
 		assert(c.tx.id > 0, "valid transaction")
 		return fmt.Sprintf("%d", c.tx.id)
 	}
 
 	if command == "abort" {
-		c.database.assertValidTransaction(c.tx)
-		c.database.completeTransaction(c.tx, AbortedTransaction)
+		c.db.assertValidTransaction(c.tx)
+		c.db.completeTransaction(c.tx, AbortedTransaction)
 		c.tx = nil
 		return ""
 	}
 
 	if command == "commit" {
-		c.database.assertValidTransaction(c.tx)
-		c.database.completeTransaction(c.tx, CommittedTransaction)
+		c.db.assertValidTransaction(c.tx)
+		c.db.completeTransaction(c.tx, CommittedTransaction)
 		c.tx = nil
 		return ""
 	}
 
 	if command == "set" || command == "delete" {
-		c.database.assertValidTransaction(c.tx)
+		c.db.assertValidTransaction(c.tx)
 
 		key := args[0]
 
 		// Mark any visible versions as now invalid.
 		found := false
-		for i := len(c.database.store[key]) - 1; i >= 0; i-- {
-			value := &c.database.store[key][i]
-			debug(value, c.tx, c.database.isvisible(c.tx, *value))
-			if c.database.isvisible(c.tx, *value) {
+		for i := len(c.db.store[key]) - 1; i >= 0; i-- {
+			value := &c.db.store[key][i]
+			debug(value, c.tx, c.db.isvisible(c.tx, *value))
+			if c.db.isvisible(c.tx, *value) {
 				value.txEndId = c.tx.id
 				found = true
 			}
@@ -271,7 +271,7 @@ func (c *Connection) execCommand(command string, args []string) string {
 		// And add a new version if it's a set command.
 		if command == "set" {
 			value := args[1]
-			c.database.store[key] = append(c.database.store[key], Value{
+			c.db.store[key] = append(c.db.store[key], Value{
 				txStartId: c.tx.id,
 				txEndId:   0,
 				value:     value,
@@ -284,13 +284,13 @@ func (c *Connection) execCommand(command string, args []string) string {
 	}
 
 	if command == "get" {
-		c.database.assertValidTransaction(c.tx)
+		c.db.assertValidTransaction(c.tx)
 
 		key := args[0]
-		for i := len(c.database.store[key]) - 1; i >= 0; i-- {
-			value := c.database.store[key][i]
-			debug(value, c.tx, c.database.isvisible(c.tx, value))
-			if c.database.isvisible(c.tx, value) {
+		for i := len(c.db.store[key]) - 1; i >= 0; i-- {
+			value := c.db.store[key][i]
+			debug(value, c.tx, c.db.isvisible(c.tx, value))
+			if c.db.isvisible(c.tx, value) {
 				return value.value
 			}
 		}
@@ -304,7 +304,7 @@ func (c *Connection) execCommand(command string, args []string) string {
 
 func (d *Database) newConnection() *Connection {
 	return &Connection{
-		database: d,
-		tx:       nil,
+		db: d,
+		tx: nil,
 	}
 }
