@@ -76,7 +76,7 @@ type Database struct {
 	inprogress        btree.Set[uint64]
 }
 
-func newDatabase(n int) Database {
+func newDatabase() Database {
 	return Database{
 		defaultIsolation:  ReadCommittedIsolation,
 		store:             map[string][]Value{},

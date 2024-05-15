@@ -5,7 +5,7 @@ import (
 )
 
 func TestReadUncommitted(t *testing.T) {
-	database := newDatabase(10)
+	database := newDatabase()
 	database.defaultIsolation = ReadUncommittedIsolation
 
 	c1 := database.newConnection()
@@ -26,7 +26,7 @@ func TestReadUncommitted(t *testing.T) {
 }
 
 func TestReadCommitted(t *testing.T) {
-	database := newDatabase(10)
+	database := newDatabase()
 	database.defaultIsolation = ReadCommittedIsolation
 
 	c1 := database.newConnection()
@@ -92,7 +92,7 @@ func TestReadCommitted(t *testing.T) {
 }
 
 func TestRepeatableRead(t *testing.T) {
-	database := newDatabase(10)
+	database := newDatabase()
 	database.defaultIsolation = RepeatableReadIsolation
 
 	c1 := database.newConnection()
@@ -164,4 +164,45 @@ func TestRepeatableRead(t *testing.T) {
 	res, err = c5.execCommand("get", []string{"x"})
 	assertEq(res, "", "c5 get x")
 	assertEq(err.Error(), "cannot get key that does not exist", "c5 get x")
+}
+
+func TestSnapshotIsolation_writewrite_conflict(t *testing.T) {
+	database := newDatabase()
+	database.defaultIsolation = SnapshotIsolation
+
+	c1 := database.newConnection()
+	c1.mustExecCommand("begin", nil)
+
+	c2 := database.newConnection()
+	c2.mustExecCommand("begin", nil)
+
+	c1.mustExecCommand("set", []string{"x", "hey"})
+	c1.mustExecCommand("commit", nil)
+
+	c2.mustExecCommand("set", []string{"x", "hey"})
+
+	res, err := c2.execCommand("commit", nil)
+	assertEq(res, "", "c2 commit")
+	assertEq(err.Error(), "write-write conflict", "c2 commit")
+}
+
+func TestSerializableIsolation_readwrite_conflict(t *testing.T) {
+	database := newDatabase()
+	database.defaultIsolation = SerializableIsolation
+
+	c1 := database.newConnection()
+	c1.mustExecCommand("begin", nil)
+
+	c2 := database.newConnection()
+	c2.mustExecCommand("begin", nil)
+
+	c1.mustExecCommand("set", []string{"x", "hey"})
+	c1.mustExecCommand("commit", nil)
+
+	_, err := c2.execCommand("get", []string{"x"})
+	assertEq(err.Error(), "cannot get key that does not exist", "c5 get x")
+
+	res, err := c2.execCommand("commit", nil)
+	assertEq(res, "", "c2 commit")
+	assertEq(err.Error(), "read-write conflict", "c2 commit")
 }
