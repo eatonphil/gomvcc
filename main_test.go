@@ -176,6 +176,9 @@ func TestSnapshotIsolation_writewrite_conflict(t *testing.T) {
 	c2 := database.newConnection()
 	c2.mustExecCommand("begin", nil)
 
+	c3 := database.newConnection()
+	c3.mustExecCommand("begin", nil)
+
 	c1.mustExecCommand("set", []string{"x", "hey"})
 	c1.mustExecCommand("commit", nil)
 
@@ -184,6 +187,10 @@ func TestSnapshotIsolation_writewrite_conflict(t *testing.T) {
 	res, err := c2.execCommand("commit", nil)
 	assertEq(res, "", "c2 commit")
 	assertEq(err.Error(), "write-write conflict", "c2 commit")
+
+	// But unrelated keys cause no conflict.
+	c3.mustExecCommand("set", []string{"y", "no conflict"})
+	c3.mustExecCommand("commit", nil)
 }
 
 func TestSerializableIsolation_readwrite_conflict(t *testing.T) {
@@ -196,6 +203,9 @@ func TestSerializableIsolation_readwrite_conflict(t *testing.T) {
 	c2 := database.newConnection()
 	c2.mustExecCommand("begin", nil)
 
+	c3 := database.newConnection()
+	c3.mustExecCommand("begin", nil)
+
 	c1.mustExecCommand("set", []string{"x", "hey"})
 	c1.mustExecCommand("commit", nil)
 
@@ -205,4 +215,8 @@ func TestSerializableIsolation_readwrite_conflict(t *testing.T) {
 	res, err := c2.execCommand("commit", nil)
 	assertEq(res, "", "c2 commit")
 	assertEq(err.Error(), "read-write conflict", "c2 commit")
+
+	// But unrelated keys cause no conflict.
+	c3.mustExecCommand("set", []string{"y", "no conflict"})
+	c3.mustExecCommand("commit", nil)
 }
