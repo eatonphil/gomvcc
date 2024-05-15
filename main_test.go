@@ -58,7 +58,7 @@ func TestReadCommitted(t *testing.T) {
 
 	// Local change is visible locally.
 	c3.mustExecCommand("set", []string{"x", "yall"})
-	
+
 	res = c3.mustExecCommand("get", []string{"x"})
 	assertEq(res, "yall", "c3 get x")
 
@@ -78,7 +78,7 @@ func TestReadCommitted(t *testing.T) {
 	res, err = c2.execCommand("get", []string{"x"})
 	assertEq(res, "", "c2 get x")
 	assertEq(err.Error(), "cannot get key that does not exist", "c2 get x")
-	
+
 	c2.mustExecCommand("commit", nil)
 
 	// It should also show up as deleted in new transactions now

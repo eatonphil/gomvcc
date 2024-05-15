@@ -59,10 +59,10 @@ const (
 type Transaction struct {
 	isolation  Isolation
 	id         uint64
-	state TransactionState
+	state      TransactionState
 	inprogress btree.Set[uint64]
-	writeset btree.Set[string]
-	readset btree.Set[string]
+	writeset   btree.Set[string]
+	readset    btree.Set[string]
 }
 
 type Database struct {
@@ -78,8 +78,8 @@ type Database struct {
 
 func newDatabase(n int) Database {
 	return Database{
-		defaultIsolation: ReadCommittedIsolation,
-		store: map[string][]Value{},
+		defaultIsolation:  ReadCommittedIsolation,
+		store:             map[string][]Value{},
 		nextTransactionId: 1,
 	}
 }
@@ -158,7 +158,8 @@ func (d *Database) completeTransaction(t *Transaction, state TransactionState) e
 	// keys as transaction B has written and committed during
 	// transaction A's life, or vice-versa.
 	if t.isolation == SerializableIsolation && d.hasConflict(t, func(t1 *Transaction, t2 *Transaction) bool {
-		return setsShareItem(t1.readset, t2.writeset) || setsShareItem(t1.writeset, t2.readset)
+		return setsShareItem(t1.readset, t2.writeset) ||
+			setsShareItem(t1.writeset, t2.readset)
 	}) {
 		return fmt.Errorf("read-write conflict")
 	}
@@ -240,7 +241,8 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 
 		// Or if the value was deleted in some other committed
 		// transaction, it's no good.
-		if value.txEndId > 0 && d.transactionState(value.txEndId).state == CommittedTransaction {
+		if value.txEndId > 0 &&
+			d.transactionState(value.txEndId).state == CommittedTransaction {
 			return false
 		}
 
@@ -251,7 +253,9 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 	// REPEATABLE READ further restricts READ COMMITTED so only
 	// versions from transactions that completed before this one
 	// started are visible.
-	assert(t.isolation == RepeatableReadIsolation || t.isolation == SnapshotIsolation || t.isolation == SerializableIsolation, "invalid isolation level")
+	assert(t.isolation == RepeatableReadIsolation ||
+		t.isolation == SnapshotIsolation ||
+		t.isolation == SerializableIsolation, "invalid isolation level")
 	// Ignore values from transactions started after this one.
 	if value.txStartId > t.id {
 		return false
