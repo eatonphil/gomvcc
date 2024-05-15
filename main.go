@@ -216,14 +216,14 @@ func (d *Database) assertValidTransaction(t *Transaction) {
 }
 
 func (d *Database) isvisible(t *Transaction, value Value) bool {
-	// READ UNCOMMITTED means we simply read the last value
+	// Read Uncommitted means we simply read the last value
 	// written. Even if the transaction that wrote this value has
 	// not committed, and even if it has aborted.
 	if t.isolation == ReadUncommittedIsolation {
 		return true
 	}
 
-	// READ COMMITTED means we are allowed to read any values that
+	// Read Committed means we are allowed to read any values that
 	// are committed at the point in time where we read.
 	if t.isolation == ReadCommittedIsolation {
 		// If the value was created by a transaction that is
@@ -250,9 +250,13 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 		return true
 	}
 
-	// REPEATABLE READ further restricts READ COMMITTED so only
-	// versions from transactions that completed before this one
-	// started are visible.
+	// Repeatable Read, Snapshot Islation, and Serializable
+	// further restricts Read Committed so only versions from
+	// transactions that completed before this one started are
+	// visible.
+
+	// Snapshot Isolation and Serializable will do additional
+	// checks at commit time.
 	assert(t.isolation == RepeatableReadIsolation ||
 		t.isolation == SnapshotIsolation ||
 		t.isolation == SerializableIsolation, "invalid isolation level")
