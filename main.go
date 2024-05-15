@@ -5,11 +5,19 @@ import (
 	"os"
 	"slices"
 	"sync"
+
+	"github.com/tidwall/btree"
 )
 
 func assert(b bool, msg string) {
 	if !b {
 		panic(msg)
+	}
+}
+
+func assertEq[C comparable](a C, b C, prefix string) {
+	if a != b {
+		panic(fmt.Sprintf("%s '%v' != '%v'", prefix, a, b))
 	}
 }
 
@@ -44,90 +52,156 @@ const (
 	ReadUncommittedIsolation Isolation = iota
 	ReadCommittedIsolation
 	RepeatableReadIsolation
+	SnapshotIsolation
 	SerializableIsolation
 )
 
 type Transaction struct {
 	isolation  Isolation
 	id         uint64
-	inprogress []uint64
+	state TransactionState
+	inprogress btree.Set[uint64]
+	writeset btree.Set[string]
+	readset btree.Set[string]
 }
 
 type Database struct {
 	mu               sync.Mutex
-	txs              chan *Transaction
 	defaultIsolation Isolation
 
 	// Must be accessed via mutex.
 	store             map[string][]Value
-	history           map[uint64]TransactionState
+	history           btree.Map[uint64, Transaction]
 	nextTransactionId uint64
-	inprogress        []uint64
+	inprogress        btree.Set[uint64]
 }
 
 func newDatabase(n int) Database {
-	txs := make(chan *Transaction, n)
-	for i := 0; i < n; i++ {
-		txs <- &Transaction{}
-	}
-
 	return Database{
-		mu:               sync.Mutex{},
-		txs:              txs,
 		defaultIsolation: ReadCommittedIsolation,
-
-		store:             map[string][]Value{},
-		history:           map[uint64]TransactionState{},
+		store: map[string][]Value{},
 		nextTransactionId: 1,
-		inprogress:        []uint64{},
 	}
 }
 
-func (d *Database) completeTransaction(t *Transaction, state TransactionState) {
+func (d *Database) hasConflict(t1 *Transaction, conflictFn func(*Transaction, *Transaction) bool) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	iter := d.history.Iter()
+
+	// First see if there is any conflict with transactions that
+	// were in progress when this one started.
+	inprogressIter := t1.inprogress.Iter()
+	for ok := inprogressIter.First(); ok; ok = inprogressIter.Next() {
+		id := inprogressIter.Key()
+		found := iter.Seek(id)
+		if !found {
+			continue
+		}
+		t2 := iter.Value()
+		if t2.state == CommittedTransaction {
+			if conflictFn(t1, &t2) {
+				return true
+			}
+		}
+	}
+
+	// Then see if there is any conflict with transactions that
+	// started and committed after this one started.
+	for id := t1.id; id < d.nextTransactionId; id++ {
+		found := iter.Seek(id)
+		if !found {
+			continue
+		}
+
+		t2 := iter.Value()
+		if t2.state == CommittedTransaction {
+			if conflictFn(t1, &t2) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func setsShareItem(s1 btree.Set[string], s2 btree.Set[string]) bool {
+	s1Iter := s1.Iter()
+	s2Iter := s2.Iter()
+	for ok := s1Iter.First(); ok; ok = s1Iter.Next() {
+		s1Key := s1Iter.Key()
+		found := s2Iter.Seek(s1Key)
+		if found {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (d *Database) completeTransaction(t *Transaction, state TransactionState) error {
 	debug("completing transaction ", t.id)
+
+	// Snapshot Isolation imposes the additional constraint that
+	// no transaction A may commit after writing any of the same
+	// keys as transaction B has written and committed during
+	// transaction A's life.
+	if t.isolation == SnapshotIsolation && d.hasConflict(t, func(t1 *Transaction, t2 *Transaction) bool {
+		return setsShareItem(t1.writeset, t2.writeset)
+	}) {
+		return fmt.Errorf("write-write conflict")
+	}
+
+	// Serializable Isolation imposes the additional constraint that
+	// no transaction A may commit after reading any of the same
+	// keys as transaction B has written and committed during
+	// transaction A's life, or vice-versa.
+	if t.isolation == SerializableIsolation && d.hasConflict(t, func(t1 *Transaction, t2 *Transaction) bool {
+		return setsShareItem(t1.readset, t2.writeset) || setsShareItem(t1.writeset, t2.readset)
+	}) {
+		return fmt.Errorf("read-write conflict")
+	}
 
 	// Update history.
 	d.mu.Lock()
-	d.history[t.id] = state
+	t.state = state
+	d.history.Set(t.id, *t)
 	d.mu.Unlock()
 
 	// Remove transaction from inprogress list.
-	d.doForInprogress(func(txId uint64, i int) {
-		if txId == t.id {
-			d.inprogress[i] = d.inprogress[len(d.inprogress)-1]
-			d.inprogress = d.inprogress[:len(d.inprogress)-1]
-			assert(!slices.Contains(d.inprogress, t.id), "inprogress cleaned up")
-		}
-	})
+	d.inprogress.Delete(t.id)
 
-	// Reset transaction state.
-	t.id = 0
-	t.inprogress = nil
-
-	// Add back to the pool.
-	d.txs <- t
+	return nil
 }
 
-func (d *Database) transactionState(txId uint64) TransactionState {
+func (d *Database) transactionState(txId uint64) Transaction {
 	d.mu.Lock()
-	s := d.history[txId]
+	t, ok := d.history.Get(txId)
+	assert(ok, "valid transaction")
 	d.mu.Unlock()
-	return s
+	return t
 }
 
-func (d *Database) nextFreeTransaction() *Transaction {
-	t := <-d.txs
-
-	// Assign and increment transaction id.
-	d.mu.Lock()
+func (d *Database) newTransaction() *Transaction {
+	t := &Transaction{}
 	t.isolation = d.defaultIsolation
+	t.state = InProgressTransaction
+
+	d.mu.Lock()
+	// Assign and increment transaction id.
 	t.id = d.nextTransactionId
-	for _, id := range d.inprogress {
-		t.inprogress = append(t.inprogress, id)
-	}
-	d.history[t.id] = InProgressTransaction
 	d.nextTransactionId++
-	d.inprogress = append(d.inprogress, t.id)
+
+	// Copy all inprogress.
+	iter := d.inprogress.Iter()
+	for ok := iter.First(); ok; ok = iter.Next() {
+		t.inprogress.Insert(iter.Key())
+	}
+
+	// Add to history and inprogress.
+	d.history.Set(t.id, *t)
+	d.inprogress.Insert(t.id)
 	d.mu.Unlock()
 
 	debug("starting transaction", t.id)
@@ -135,17 +209,9 @@ func (d *Database) nextFreeTransaction() *Transaction {
 	return t
 }
 
-func (d *Database) doForInprogress(do func(uint64, int)) {
-	d.mu.Lock()
-	for i, txId := range d.inprogress {
-		do(txId, i)
-	}
-	d.mu.Unlock()
-}
-
 func (d *Database) assertValidTransaction(t *Transaction) {
 	assert(t.id > 0, "valid id")
-	assert(d.transactionState(t.id) == InProgressTransaction, "in progress")
+	assert(d.transactionState(t.id).state == InProgressTransaction, "in progress")
 }
 
 func (d *Database) isvisible(t *Transaction, value Value) bool {
@@ -162,8 +228,8 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 		// If the value was created by a transaction that is
 		// not committed, and not this current transaction,
 		// it's no good.
-		if d.transactionState(value.txStartId) != CommittedTransaction &&
-			value.txStartId != t.id {
+		if value.txStartId != t.id &&
+			d.transactionState(value.txStartId).state != CommittedTransaction {
 			return false
 		}
 
@@ -174,7 +240,7 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 
 		// Or if the value was deleted in some other committed
 		// transaction, it's no good.
-		if d.transactionState(value.txEndId) == CommittedTransaction {
+		if value.txEndId > 0 && d.transactionState(value.txEndId).state == CommittedTransaction {
 			return false
 		}
 
@@ -185,7 +251,7 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 	// REPEATABLE READ further restricts READ COMMITTED so only
 	// versions from transactions that completed before this one
 	// started are visible.
-	assert(t.isolation == RepeatableReadIsolation, "is repeatable read")
+	assert(t.isolation == RepeatableReadIsolation || t.isolation == SnapshotIsolation || t.isolation == SerializableIsolation, "invalid isolation level")
 	// Ignore values from transactions started after this one.
 	if value.txStartId > t.id {
 		return false
@@ -193,13 +259,13 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 
 	// Ignore values created from transactions in progress when
 	// this one started.
-	if slices.Contains(t.inprogress, value.txStartId) {
+	if t.inprogress.Contains(value.txStartId) {
 		return false
 	}
 
 	// If the value was created by a transaction that is not
 	// committed, and not this current transaction, it's no good.
-	if d.transactionState(value.txStartId) != CommittedTransaction &&
+	if d.transactionState(value.txStartId).state != CommittedTransaction &&
 		value.txStartId != t.id {
 		return false
 	}
@@ -212,8 +278,9 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 	// Or if the value was deleted in some other committed
 	// transaction that started before this one, it's no good.
 	if value.txEndId < t.id &&
-		d.transactionState(value.txEndId) == CommittedTransaction &&
-		!slices.Contains(t.inprogress, value.txEndId) {
+		value.txEndId > 0 &&
+		d.transactionState(value.txEndId).state == CommittedTransaction &&
+		!t.inprogress.Contains(value.txEndId) {
 		return false
 	}
 
@@ -225,28 +292,28 @@ type Connection struct {
 	db *Database
 }
 
-func (c *Connection) execCommand(command string, args []string) string {
+func (c *Connection) execCommand(command string, args []string) (string, error) {
 	debug(command, args)
 
 	if command == "begin" {
-		c.tx = c.db.nextFreeTransaction()
+		c.tx = c.db.newTransaction()
 		c.db.assertValidTransaction(c.tx)
 		assert(c.tx.id > 0, "valid transaction")
-		return fmt.Sprintf("%d", c.tx.id)
+		return fmt.Sprintf("%d", c.tx.id), nil
 	}
 
 	if command == "abort" {
 		c.db.assertValidTransaction(c.tx)
-		c.db.completeTransaction(c.tx, AbortedTransaction)
+		err := c.db.completeTransaction(c.tx, AbortedTransaction)
 		c.tx = nil
-		return ""
+		return "", err
 	}
 
 	if command == "commit" {
 		c.db.assertValidTransaction(c.tx)
-		c.db.completeTransaction(c.tx, CommittedTransaction)
+		err := c.db.completeTransaction(c.tx, CommittedTransaction)
 		c.tx = nil
-		return ""
+		return "", err
 	}
 
 	if command == "set" || command == "delete" {
@@ -254,7 +321,7 @@ func (c *Connection) execCommand(command string, args []string) string {
 
 		key := args[0]
 
-		// Mark any visible versions as now invalid.
+		// Mark all visible versions as now invalid.
 		found := false
 		for i := len(c.db.store[key]) - 1; i >= 0; i-- {
 			value := &c.db.store[key][i]
@@ -265,8 +332,10 @@ func (c *Connection) execCommand(command string, args []string) string {
 			}
 		}
 		if command == "delete" && !found {
-			assert(false, "cannot delete unset value")
+			return "", fmt.Errorf("cannot delete key that does not exist")
 		}
+
+		c.tx.writeset.Insert(key)
 
 		// And add a new version if it's a set command.
 		if command == "set" {
@@ -277,29 +346,38 @@ func (c *Connection) execCommand(command string, args []string) string {
 				value:     value,
 			})
 
-			return value
+			return value, nil
 		}
 
-		return ""
+		// Delete ok.
+		return "", nil
 	}
 
 	if command == "get" {
 		c.db.assertValidTransaction(c.tx)
 
 		key := args[0]
+
+		c.tx.readset.Insert(key)
+
 		for i := len(c.db.store[key]) - 1; i >= 0; i-- {
 			value := c.db.store[key][i]
 			debug(value, c.tx, c.db.isvisible(c.tx, value))
 			if c.db.isvisible(c.tx, value) {
-				return value.value
+				return value.value, nil
 			}
 		}
 
-		return ""
+		return "", fmt.Errorf("cannot get key that does not exist")
 	}
 
-	assert(false, "no such command")
-	return ""
+	return "", fmt.Errorf("no such command")
+}
+
+func (c *Connection) mustExecCommand(cmd string, args []string) string {
+	res, err := c.execCommand(cmd, args)
+	assertEq(err, nil, "unexpected error")
+	return res
 }
 
 func (d *Database) newConnection() *Connection {
@@ -307,4 +385,8 @@ func (d *Database) newConnection() *Connection {
 		db: d,
 		tx: nil,
 	}
+}
+
+func main() {
+	panic("unimplemented")
 }
