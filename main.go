@@ -306,9 +306,9 @@ func (c *Connection) execCommand(command string, args []string) (string, error) 
 	debug(command, args)
 
 	if command == "begin" {
+		assertEq(c.tx, nil, "no running transactions")
 		c.tx = c.db.newTransaction()
 		c.db.assertValidTransaction(c.tx)
-		assert(c.tx.id > 0, "valid transaction")
 		return fmt.Sprintf("%d", c.tx.id), nil
 	}
 
