@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"sync"
 
 	"github.com/tidwall/btree"
 )
@@ -66,10 +65,7 @@ type Transaction struct {
 }
 
 type Database struct {
-	mu               sync.Mutex
 	defaultIsolation Isolation
-
-	// Must be accessed via mutex.
 	store             map[string][]Value
 	history           btree.Map[uint64, Transaction]
 	nextTransactionId uint64
@@ -85,9 +81,6 @@ func newDatabase() Database {
 }
 
 func (d *Database) hasConflict(t1 *Transaction, conflictFn func(*Transaction, *Transaction) bool) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	iter := d.history.Iter()
 
 	// First see if there is any conflict with transactions that
@@ -165,10 +158,8 @@ func (d *Database) completeTransaction(t *Transaction, state TransactionState) e
 	}
 
 	// Update history.
-	d.mu.Lock()
 	t.state = state
 	d.history.Set(t.id, *t)
-	d.mu.Unlock()
 
 	// Remove transaction from inprogress list.
 	d.inprogress.Delete(t.id)
@@ -177,10 +168,8 @@ func (d *Database) completeTransaction(t *Transaction, state TransactionState) e
 }
 
 func (d *Database) transactionState(txId uint64) Transaction {
-	d.mu.Lock()
 	t, ok := d.history.Get(txId)
 	assert(ok, "valid transaction")
-	d.mu.Unlock()
 	return t
 }
 
@@ -189,7 +178,6 @@ func (d *Database) newTransaction() *Transaction {
 	t.isolation = d.defaultIsolation
 	t.state = InProgressTransaction
 
-	d.mu.Lock()
 	// Assign and increment transaction id.
 	t.id = d.nextTransactionId
 	d.nextTransactionId++
@@ -203,7 +191,6 @@ func (d *Database) newTransaction() *Transaction {
 	// Add to history and inprogress.
 	d.history.Set(t.id, *t)
 	d.inprogress.Insert(t.id)
-	d.mu.Unlock()
 
 	debug("starting transaction", t.id)
 
