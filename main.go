@@ -45,6 +45,7 @@ const (
 	CommittedTransaction
 )
 
+// Loosest isolation at the top, strictest isolation at the bottom.
 type Isolation uint8
 
 const (
@@ -56,12 +57,16 @@ const (
 )
 
 type Transaction struct {
-	isolation  Isolation
-	id         uint64
-	state      TransactionState
+	isolation Isolation
+	id        uint64
+	state     TransactionState
+
+	// Used only by Repeatable Read and stricter.
 	inprogress btree.Set[uint64]
-	writeset   btree.Set[string]
-	readset    btree.Set[string]
+
+	// Used only by Snapshot Isolation and stricter.
+	writeset btree.Set[string]
+	readset  btree.Set[string]
 }
 
 type Database struct {
@@ -69,13 +74,15 @@ type Database struct {
 	store             map[string][]Value
 	history           btree.Map[uint64, Transaction]
 	nextTransactionId uint64
-	inprogress        btree.Set[uint64]
 }
 
 func newDatabase() Database {
 	return Database{
-		defaultIsolation:  ReadCommittedIsolation,
-		store:             map[string][]Value{},
+		defaultIsolation: ReadCommittedIsolation,
+		store:            map[string][]Value{},
+		// The `0` transaction id will be used to mean that
+		// the id was not set. So all valid transaction ids
+		// must start at 1.
 		nextTransactionId: 1,
 	}
 }
@@ -136,33 +143,34 @@ func setsShareItem(s1 btree.Set[string], s2 btree.Set[string]) bool {
 func (d *Database) completeTransaction(t *Transaction, state TransactionState) error {
 	debug("completing transaction ", t.id)
 
-	// Snapshot Isolation imposes the additional constraint that
-	// no transaction A may commit after writing any of the same
-	// keys as transaction B has written and committed during
-	// transaction A's life.
-	if t.isolation == SnapshotIsolation && d.hasConflict(t, func(t1 *Transaction, t2 *Transaction) bool {
-		return setsShareItem(t1.writeset, t2.writeset)
-	}) {
-		return fmt.Errorf("write-write conflict")
-	}
+	if state == CommittedTransaction {
+		// Snapshot Isolation imposes the additional constraint that
+		// no transaction A may commit after writing any of the same
+		// keys as transaction B has written and committed during
+		// transaction A's life.
+		if t.isolation == SnapshotIsolation && d.hasConflict(t, func(t1 *Transaction, t2 *Transaction) bool {
+			return setsShareItem(t1.writeset, t2.writeset)
+		}) {
+			d.completeTransaction(t, AbortedTransaction)
+			return fmt.Errorf("write-write conflict")
+		}
 
-	// Serializable Isolation imposes the additional constraint that
-	// no transaction A may commit after reading any of the same
-	// keys as transaction B has written and committed during
-	// transaction A's life, or vice-versa.
-	if t.isolation == SerializableIsolation && d.hasConflict(t, func(t1 *Transaction, t2 *Transaction) bool {
-		return setsShareItem(t1.readset, t2.writeset) ||
-			setsShareItem(t1.writeset, t2.readset)
-	}) {
-		return fmt.Errorf("read-write conflict")
+		// Serializable Isolation imposes the additional constraint that
+		// no transaction A may commit after reading any of the same
+		// keys as transaction B has written and committed during
+		// transaction A's life, or vice-versa.
+		if t.isolation == SerializableIsolation && d.hasConflict(t, func(t1 *Transaction, t2 *Transaction) bool {
+			return setsShareItem(t1.readset, t2.writeset) ||
+				setsShareItem(t1.writeset, t2.readset)
+		}) {
+			d.completeTransaction(t, AbortedTransaction)
+			return fmt.Errorf("read-write conflict")
+		}
 	}
 
 	// Update history.
 	t.state = state
 	d.history.Set(t.id, *t)
-
-	// Remove transaction from inprogress list.
-	d.inprogress.Delete(t.id)
 
 	return nil
 }
@@ -171,6 +179,17 @@ func (d *Database) transactionState(txId uint64) Transaction {
 	t, ok := d.history.Get(txId)
 	assert(ok, "valid transaction")
 	return t
+}
+
+func (d *Database) inprogress() btree.Set[uint64] {
+	var ids btree.Set[uint64]
+	iter := d.history.Iter()
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if iter.Value().state == InProgressTransaction {
+			ids.Insert(iter.Key())
+		}
+	}
+	return ids
 }
 
 func (d *Database) newTransaction() *Transaction {
@@ -182,15 +201,11 @@ func (d *Database) newTransaction() *Transaction {
 	t.id = d.nextTransactionId
 	d.nextTransactionId++
 
-	// Copy all inprogress.
-	iter := d.inprogress.Iter()
-	for ok := iter.First(); ok; ok = iter.Next() {
-		t.inprogress.Insert(iter.Key())
-	}
+	// Store all inprogress transaction ids.
+	t.inprogress = d.inprogress()
 
-	// Add to history and inprogress.
+	// Add this transaction to history.
 	d.history.Set(t.id, *t)
-	d.inprogress.Insert(t.id)
 
 	debug("starting transaction", t.id)
 
