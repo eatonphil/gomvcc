@@ -72,7 +72,7 @@ type Transaction struct {
 type Database struct {
 	defaultIsolation  Isolation
 	store             map[string][]Value
-	history           btree.Map[uint64, Transaction]
+	transactions      btree.Map[uint64, Transaction]
 	nextTransactionId uint64
 }
 
@@ -88,7 +88,7 @@ func newDatabase() Database {
 }
 
 func (d *Database) hasConflict(t1 *Transaction, conflictFn func(*Transaction, *Transaction) bool) bool {
-	iter := d.history.Iter()
+	iter := d.transactions.Iter()
 
 	// First see if there is any conflict with transactions that
 	// were in progress when this one started.
@@ -168,22 +168,22 @@ func (d *Database) completeTransaction(t *Transaction, state TransactionState) e
 		}
 	}
 
-	// Update history.
+	// Update transactions.
 	t.state = state
-	d.history.Set(t.id, *t)
+	d.transactions.Set(t.id, *t)
 
 	return nil
 }
 
 func (d *Database) transactionState(txId uint64) Transaction {
-	t, ok := d.history.Get(txId)
+	t, ok := d.transactions.Get(txId)
 	assert(ok, "valid transaction")
 	return t
 }
 
 func (d *Database) inprogress() btree.Set[uint64] {
 	var ids btree.Set[uint64]
-	iter := d.history.Iter()
+	iter := d.transactions.Iter()
 	for ok := iter.First(); ok; ok = iter.Next() {
 		if iter.Value().state == InProgressTransaction {
 			ids.Insert(iter.Key())
@@ -205,7 +205,7 @@ func (d *Database) newTransaction() *Transaction {
 	t.inprogress = d.inprogress()
 
 	// Add this transaction to history.
-	d.history.Set(t.id, *t)
+	d.transactions.Set(t.id, *t)
 
 	debug("starting transaction", t.id)
 
