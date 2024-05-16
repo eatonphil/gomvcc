@@ -65,7 +65,7 @@ type Transaction struct {
 }
 
 type Database struct {
-	defaultIsolation Isolation
+	defaultIsolation  Isolation
 	store             map[string][]Value
 	history           btree.Map[uint64, Transaction]
 	nextTransactionId uint64
