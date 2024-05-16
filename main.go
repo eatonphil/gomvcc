@@ -252,7 +252,7 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 		return true
 	}
 
-	// Repeatable Read, Snapshot Islation, and Serializable
+	// Repeatable Read, Snapshot Isolation, and Serializable
 	// further restricts Read Committed so only versions from
 	// transactions that completed before this one started are
 	// visible.
