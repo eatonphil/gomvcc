@@ -222,7 +222,9 @@ func (d *Database) isvisible(t *Transaction, value Value) bool {
 	// written. Even if the transaction that wrote this value has
 	// not committed, and even if it has aborted.
 	if t.isolation == ReadUncommittedIsolation {
-		return true
+		// We must merely make sure the value has not been
+		// deleted.
+		return value.txEndId == 0
 	}
 
 	// Read Committed means we are allowed to read any values that

@@ -23,6 +23,18 @@ func TestReadUncommitted(t *testing.T) {
 	// But since read uncommitted, also available to everyone else.
 	res = c2.mustExecCommand("get", []string{"x"})
 	assertEq(res, "hey", "c2 get x")
+
+	// And if we delete, that should be respected.
+	res = c1.mustExecCommand("delete", []string{"x"})
+	assertEq(res, "", "c1 delete x")
+
+	res, err := c1.execCommand("get", []string{"x"})
+	assertEq(res, "", "c1 sees no x")
+	assertEq(err.Error(), "cannot get key that does not exist", "c1 sees no x")
+
+	res, err = c2.execCommand("get", []string{"x"})
+	assertEq(res, "", "c2 sees no x")
+	assertEq(err.Error(), "cannot get key that does not exist", "c2 sees no x")
 }
 
 func TestReadCommitted(t *testing.T) {
